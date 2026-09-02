@@ -1,0 +1,47 @@
+{
+  "title": "Sinov taqdimoti",
+  "theme": "corporate",
+  "slides": [
+    {"type": "title", "heading": "Raqamli transformatsiya asoslari", "subheading": "Korxonalarda texnologik yangilanish strategiyasi", "tags": ["IT", "biznes", "innovatsiya"]},
+    {"type": "bullets", "heading": "Asosiy yo'nalishlar", "bullets": [
+      {"title": "Raqamli infratuzilma", "detail": "Zamonaviy tarmoq va bulutli xizmatlar korxona samaradorligini sezilarli oshiradi"},
+      {"title": "Kadrlar salohiyati", "detail": "Xodimlarni qayta tayyorlash orqali raqamli ko'nikmalarni kengaytirish muhim"},
+      {"title": "Ma'lumotlar tahlili", "detail": "Katta hajmdagi ma'lumotlarni tahlil qilish qaror qabul qilishni tezlashtiradi"},
+      {"title": "Xavfsizlik", "detail": "Kiberxavfsizlik choralari mijozlar ishonchini saqlashning asosidir"}]},
+    {"type": "two_column", "heading": "Imkoniyat va xavflar",
+     "left_title": "Imkoniyatlar",
+     "left_points": [
+       {"title": "Tezkor o'sish", "detail": "Raqamli kanallar orqali sotuvlar hajmini kengaytirish imkoniyati"},
+       {"title": "Global bozor", "detail": "Internet orqali xorijiy mijozlarga chiqish osonlashadi"}],
+     "right_title": "Xavflar",
+     "right_points": [
+       {"title": "Raqobat", "detail": "Yangi texnologiyalar bilan kirib kelgan o'yinchilar bosim o'tkazadi"},
+       {"title": "Qonunchilik", "detail": "O'zgaruvchan normativ hujjatlar moslashishni talab qiladi"}]},
+    {"type": "timeline", "heading": "Amalga oshirish bosqichlari", "steps": [
+      {"title": "Tahlil", "detail": "Bozor va mijozlar ehtiyojini chuqur o'rganish, ma'lumotlarni yig'ish"},
+      {"title": "Prototip", "detail": "Minimal mahsulot versiyasini yaratish va foydalanuvchilar bilan sinash"},
+      {"title": "Ishga tushirish", "detail": "To'liq mahsulotni bozorga chiqarish va marketing kampaniyasi"},
+      {"title": "Masshtablash", "detail": "Xalqaro bozorlarga chiqish va operatsion samaradorlikni oshirish"}]},
+    {"type": "icon_grid", "heading": "To'rt asosiy ustun", "items": [
+      {"icon": "⚡", "title": "Tezlik", "detail": "Jarayonlarni optimallashtirish orqali vaqtni tejaymiz"},
+      {"icon": "🛡️", "title": "Xavfsizlik", "detail": "Ma'lumotlar shifrlangan holda saqlanadi"},
+      {"icon": "🎯", "title": "Aniqlik", "detail": "Natijalarni o'lchash tizimi mavjud"},
+      {"icon": "🌱", "title": "Barqarorlik", "detail": "Uzoq muddatli rivojlanish strategiyasi"}]},
+    {"type": "stats_grid", "heading": "Raqamlarda", "stats": [
+      {"value": "2.5M", "label": "faol foydalanuvchilar soni"},
+      {"value": "98%", "label": "mijozlar qoniqish darajasi"},
+      {"value": "145", "label": "mamlakatda xizmat ko'rsatamiz"},
+      {"value": "12", "label": "yillik tajribaga egamiz"}]},
+    {"type": "big_stat", "heading": "Bozor hajmi 2030 yilga borib", "stat": "1.8T$",
+     "stat_label": "global AI bozori prognozi",
+     "context": "Yillik o'sish sur'ati 37 foizni tashkil etadi va bu tendensiya keyingi yillarda ham davom etishi kutilmoqda."},
+    {"type": "quote", "quote_text": "Innovatsiya — bu o'zgarishga bo'lgan ishonch",
+     "quote_author": "Anonim", "context": "Har bir sohada yangi texnologiyalar joriy etilmoqda."},
+    {"type": "bar_chart", "heading": "Yillik daromad o'sishi", "bars": [
+      {"label": "2022", "value": 40}, {"label": "2023", "value": 62},
+      {"label": "2024", "value": 88}, {"label": "2025", "value": 120}]},
+    {"type": "table", "heading": "Xizmatlar taqqoslash", "columns": ["Xususiyat", "Standart", "Premium"],
+     "rows": [["Yuklab olish", "10 GB", "Cheksiz"], ["Yordam", "Email", "24/7"], ["Narx", "Bepul", "49$"]]},
+    {"type": "closing", "heading": "Rahmat!", "subheading": "Savollaringiz bo'lsa, marhamat"}
+  ]
+}

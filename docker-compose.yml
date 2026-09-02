@@ -1,0 +1,51 @@
+# Contabo / istalgan VPS uchun docker-compose:
+# backend (FastAPI + Chromium) va Telegram bot — ikkalasi bir konteyner
+# image'ida, alohida servis sifatida.
+#
+# Ishga tushirish:
+#   cp .env.example .env   # kalitlarni kiriting
+#   docker compose up -d --build
+#
+# Loglar:
+#   docker compose logs -f backend
+#   docker compose logs -f bot
+#
+# Yangilash (repo'dan so'nggi kodni olish):
+#   git pull && docker compose up -d --build
+#
+# DIQQAT: backend holati xotirada (in-memory navbat) — shuning uchun
+# backend faqat BIRTA nusxada ishlashi kerak (replicas: 1, workers: 1).
+# Trafik juda ko'paysa — Redis'ga o'tish vaqti keldi (README ga qarang).
+
+services:
+  backend:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+    env_file: .env
+    environment:
+      # Konteyner ichida bot servis manzili sifatida xizmat nomi ishlatiladi
+      API_BASE: http://backend:8000
+    # Veb-UI yo'q — port tashqariga ochilmaydi (faqat bot ichki tarmoqda
+    # gaplashadi). Debug uchun kerak bo'lsa quyidagini oching:
+    # ports:
+    #   - "8003:8000"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  bot:
+    build: .
+    command: python -m bot.telegram_bot
+    env_file: .env
+    environment:
+      API_BASE: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

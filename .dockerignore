@@ -1,0 +1,12 @@
+# .git, .venv, test chiqimlari va sirlarni image'ga kiritmaymiz
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.local
+test_output
+*.pdf
+*.pptx
+.npm
+.cache
