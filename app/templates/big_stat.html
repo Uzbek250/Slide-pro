@@ -39,7 +39,7 @@
   }
 {% endblock %}
 {% block content %}
-<div class="slide stat-slide">
+<div class="slide stat-slide" {{ accent_style|safe }}>
   <div class="accent-bar"></div>
   {% if heading %}<div class="heading">{{ heading }}</div>{% endif %}
   <div class="stat-number">{{ stat }}</div>

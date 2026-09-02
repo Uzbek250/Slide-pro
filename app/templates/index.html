@@ -328,12 +328,17 @@ form.addEventListener('submit', async (e) => {
   resultEl.classList.remove('visible');
   errorBox.classList.remove('visible');
   statusEl.classList.add('visible');
-  statusText.textContent = 'Taqdimot tayyorlanmoqda va sifati tekshirilmoqda... (bir necha daqiqa vaqt olishi mumkin)';
   submitBtn.disabled = true;
 
   const topic = document.getElementById('topic').value;
   const slideCount = parseInt(document.getElementById('slideCount').value, 10);
   const theme = document.querySelector('input[name="theme"]:checked').value;
+
+  const stageLabels = {
+    llm: 'Matn tayyorlanmoqda (Gemini)...',
+    render: 'Slaydlar render qilinmoqda (Chromium)...',
+    merge: 'PDF yig\'ilmoqda...'
+  };
 
   try {
     const resp = await fetch('/generate', {
@@ -348,9 +353,43 @@ form.addEventListener('submit', async (e) => {
     }
 
     const data = await resp.json();
-    downloadLink.href = '/download/' + data.file_id;
-    downloadLink.setAttribute('download', data.filename || 'presentation.pdf');
-    resultEl.classList.add('visible');
+    const jobId = data.job_id;
+
+    // Holatni kuzatish: navbat → progress → tayyor
+    let finished = false;
+    while (!finished) {
+      const sResp = await fetch('/status/' + jobId);
+      if (!sResp.ok) {
+        throw new Error('Holatni o\'qib bo\'lmadi');
+      }
+      const s = await sResp.json();
+
+      if (s.status === 'queued') {
+        statusText.textContent = '⏳ Navbatda: oldingizda ' + s.queue_position +
+          ' ta so\'rov (~' + s.eta_seconds + ' s)';
+      } else if (s.status === 'running') {
+        const pr = s.progress || {};
+        const stageTxt = stageLabels[pr.stage] || 'Tayyorlanmoqda...';
+        const slideTxt = pr.total_slides
+          ? ' (' + pr.slide + '/' + pr.total_slides + ' slayd)'
+          : '';
+        statusText.textContent = stageTxt + ' ' + pr.pct + '%' + slideTxt +
+          (s.eta_seconds ? ' — taxminan ' + s.eta_seconds + ' s qoldi' : '');
+      } else if (s.status === 'done') {
+        downloadLink.href = '/download/' + jobId;
+        downloadLink.setAttribute('download', s.filename || 'presentation.pdf');
+        resultEl.classList.add('visible');
+        finished = true;
+      } else if (s.status === 'cancelled') {
+        throw new Error('Ish bekor qilindi');
+      } else {
+        throw new Error(s.error || 'Generatsiya xatoligi yuz berdi');
+      }
+
+      if (!finished) {
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
   } catch (err) {
     errorBox.textContent = err.message;
     errorBox.classList.add('visible');

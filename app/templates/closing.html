@@ -12,7 +12,7 @@
   }
 {% endblock %}
 {% block content %}
-<div class="slide closing-slide">
+<div class="slide closing-slide" {{ accent_style|safe }}>
   <div class="accent-bar"></div>
   <div class="heading">{{ heading }}</div>
   {% if subheading %}<div class="subheading">{{ subheading }}</div>{% endif %}

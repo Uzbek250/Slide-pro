@@ -39,12 +39,57 @@
     margin-top: 6px;
     font-weight: 500;
   }
+
+  {# Variant 2 — kartalar panjara (faqat kam sonli bullets uchun) #}
+  .bullet-list.cards {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 34px;
+    margin-top: 56px;
+    flex: 1;
+    align-content: start;
+  }
+  .bullet-list.cards .bullet-item {
+    background: var(--card-bg);
+    border-radius: 28px;
+    padding: 34px 38px;
+    border-left: 12px solid var(--accent);
+    gap: 24px;
+  }
+  .bullet-list.cards .bullet-num {
+    background: var(--accent);
+    color: #ffffff;
+    border: none;
+    width: 56px;
+    height: 56px;
+    font-size: 26px;
+  }
+  .bullet-list.cards .bullet-text {
+    font-size: 33px;
+    padding-top: 4px;
+  }
+  .bullet-list.cards .bullet-sub {
+    font-size: 28px;
+  }
 {% endblock %}
 {% block content %}
-<div class="slide">
+<div class="slide" {{ accent_style|safe }}>
   <div class="accent-bar"></div>
   <div class="heading">{{ heading }}</div>
   {% if subheading %}<div class="subheading" style="margin-top:-32px; margin-bottom:32px;">{{ subheading }}</div>{% endif %}
+  {% if variant == 1 and (bullets | length <= 6) %}
+  <div class="bullet-list cards">
+    {% for point in bullets %}
+    <div class="bullet-item">
+      <div class="bullet-num">{{ loop.index }}</div>
+      <div>
+        <div class="bullet-text">{{ point.title if point is mapping else point }}</div>
+        {% if point is mapping and point.detail %}<div class="bullet-sub">{{ point.detail }}</div>{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
   <div class="bullet-list">
     {% for point in bullets %}
     <div class="bullet-item">
@@ -56,6 +101,7 @@
     </div>
     {% endfor %}
   </div>
+  {% endif %}
   <div class="page-number">{{ page_num }}</div>
 </div>
 {% endblock %}

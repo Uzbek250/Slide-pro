@@ -36,12 +36,50 @@
     color: var(--accent);
     border: 2px solid var(--accent);
   }
+
+  {# Variant 2 — markazlashtirilgan, pastki accent chiziqli #}
+  .title-slide.centered {
+    align-items: center;
+    text-align: center;
+    padding-top: 60px;
+  }
+  .title-slide.centered .heading {
+    text-align: center;
+    max-width: 1500px;
+  }
+  .title-slide.centered .subheading {
+    text-align: center;
+    margin-left: auto;
+    margin-right: auto;
+  }
+  .title-slide.centered .rule {
+    width: 180px;
+    height: 14px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    margin: 0 auto 44px auto;
+  }
+  .title-slide.centered .tags {
+    justify-content: center;
+  }
+  .title-slide.centered .kicker {
+    padding: 10px 30px;
+    border-radius: 999px;
+    background: var(--card-bg);
+    border: 2px solid var(--accent);
+  }
 {% endblock %}
 {% block content %}
-<div class="slide title-slide">
+<div class="slide title-slide{{ ' centered' if variant == 1 }}" {{ accent_style|safe }}>
   <div class="accent-bar"></div>
-  <div class="kicker">Prezentatsiya</div>
-  <div class="heading">{{ heading }}</div>
+  {% if variant == 1 %}
+    <div class="kicker">Prezentatsiya</div>
+    <div class="heading">{{ heading }}</div>
+    <div class="rule"></div>
+  {% else %}
+    <div class="kicker">Prezentatsiya</div>
+    <div class="heading">{{ heading }}</div>
+  {% endif %}
   {% if subheading %}<div class="subheading">{{ subheading }}</div>{% endif %}
   {% if tags %}
   <div class="tags">
