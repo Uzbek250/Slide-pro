@@ -250,9 +250,17 @@ class JobManager:
                 job.finished_at = time.time()
             logger.info("Job %s foydalanuvchi tomonidan bekor qilindi", job.job_id[:8])
         except Exception as exc:  # noqa: BLE001
+            # XAVFSIZLIK: xatoning to'liq matnini (str(exc)) to'g'ridan-to'g'ri
+            # foydalanuvchiga ko'rsatmaymiz — bunda tashqi API'dan kelgan ichki
+            # tafsilotlar (masalan xato javobi ichidagi texnik ma'lumot) oshkor
+            # bo'lishi mumkin edi. Foydalanuvchiga faqat umumiy, xavfsiz xabar
+            # ko'rsatiladi; to'liq xato faqat server logiga (pastda) yoziladi.
             with self._lock:
                 job.status = "error"
-                job.error = str(exc)[:400]
+                job.error = (
+                    "Ichki xatolik yuz berdi. Iltimos, qayta urinib ko'ring "
+                    "yoki bir necha daqiqadan keyin sinab ko'ring."
+                )
                 job.finished_at = time.time()
             # Server xatosi — foydalanuvchi limiti yemasligi kerak
             try:

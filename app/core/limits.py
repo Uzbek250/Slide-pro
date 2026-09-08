@@ -60,10 +60,15 @@ class RateLimiter:
         while dq and now - dq[0] > window:
             dq.popleft()
 
-    def check(self, key: str) -> tuple[bool, str, int]:
+    def check(self, key: str, extra_daily: int = 0) -> tuple[bool, str, int]:
         """
         (ruxsat, sabab, retry_after_sekund) qaytaradi. Hisobni oshirmaydi —
         so'rov qabul qilinganda alohida record() chaqiriladi.
+
+        extra_daily: shu foydalanuvchiga referal orqali qo'shilgan bonus
+        kunlik limit (asosiy self.per_day ustiga qo'shiladi). Bu boshqa
+        foydalanuvchilarning limitiga ta'sir qilmaydi — faqat shu key
+        uchun chaqiruvchi tomonidan hisoblab beriladi (qarang: main.py).
         """
         now = time.time()
         with self._lock:
@@ -91,11 +96,12 @@ class RateLimiter:
                     retry,
                 )
 
-            if self.per_day and len(dq) >= self.per_day:
+            effective_per_day = (self.per_day + extra_daily) if self.per_day else 0
+            if effective_per_day and len(dq) >= effective_per_day:
                 retry = int(86400 - (now - dq[0])) + 1
                 return (
                     False,
-                    f"Kunlik limit tugadi ({self.per_day} ta/kun). "
+                    f"Kunlik limit tugadi ({effective_per_day} ta/kun). "
                     f"{max(retry // 3600, 1)} soatdan keyin qayta urinib ko'ring.",
                     retry,
                 )
@@ -127,7 +133,7 @@ class RateLimiter:
             self._hits[key].append(now)
             self._global.append(now)
 
-    def remaining(self, key: str) -> dict[str, int]:
+    def remaining(self, key: str, extra_daily: int = 0) -> dict[str, int]:
         now = time.time()
         with self._lock:
             dq = self._hits[key]
@@ -135,10 +141,12 @@ class RateLimiter:
             self._trim(self._global, 86400, now)
             minute_hits = sum(1 for t in dq if now - t <= 60)
             hour_hits = sum(1 for t in dq if now - t <= 3600)
+            effective_per_day = (self.per_day + extra_daily) if self.per_day else 0
             return {
                 "minute_left": max(self.per_minute - minute_hits, 0) if self.per_minute else -1,
                 "hour_left": max(self.per_hour - hour_hits, 0) if self.per_hour else -1,
-                "day_left": max(self.per_day - len(dq), 0) if self.per_day else -1,
+                "day_left": max(effective_per_day - len(dq), 0) if effective_per_day else -1,
+                "day_limit": effective_per_day if effective_per_day else -1,
                 "global_minute_left": (
                     max(self.global_per_minute - sum(1 for t in self._global if now - t <= 60), 0)
                     if self.global_per_minute

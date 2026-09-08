@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from app.core import jobs
 from app.core.limits import limiter
+from app.core import referrals
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +43,11 @@ app = FastAPI(title="Slide Bot API")
 # Ichki mijozlar (Telegram bot) o'z foydalanuvchi identifikatorini bera oladi —
 # aks holda hamma bot foydalanuvchilari bitta IP sifatida hisoblanardi.
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
+
+# Nechta reverse proxy qatlami orqali so'rov o'tishi (0 = proxy yo'q, to'g'ridan
+# to'g'ri ulanish — X-Forwarded-For headeriga umuman ishonilmaydi, chunki uni
+# mijoz o'zi yuborishi mumkin). nginx kabi bitta proxy ortida bo'lsa — 1.
+TRUSTED_PROXY_COUNT = int(os.environ.get("TRUSTED_PROXY_COUNT", "0") or "0")
 
 _MEDIA_TYPES = {
     "pdf": "application/pdf",
@@ -64,7 +70,15 @@ def _client_key(request: Request) -> str:
     """
     Rate limiting kaliti. Ichki token bilan kelgan so'rov o'z identifikatorini
     belgilashi mumkin (bot foydalanuvchilari), aks holda IP ishlatiladi.
-    Reverse proxy ortida X-Forwarded-For ning birinchi qiymati olinadi.
+
+    XAVFSIZLIK: X-Forwarded-For — bu oddiy HTTP header, uni istalgan mijoz
+    o'zi qalbakilashtirib yubora oladi (masalan har so'rovda tasodifiy IP
+    yozib, rate limitni butunlay chetlab o'tish mumkin edi). Shu sababli bu
+    headerga FAQAT TRUSTED_PROXY_COUNT muhit o'zgaruvchisi ochiq belgilangan
+    bo'lsagina ishonamiz (ya'ni reverse proxy — masalan nginx/Cloudflare —
+    borligi va nechta proxy qatlami borligi ma'lum bo'lsa). Aks holda har
+    doim ulanishning haqiqiy socket IP manzili (request.client.host)
+    ishlatiladi — buni mijoz soxtalashtira olmaydi.
     """
     if INTERNAL_TOKEN:
         token = request.headers.get("x-internal-token", "")
@@ -72,9 +86,16 @@ def _client_key(request: Request) -> str:
         if token and token == INTERNAL_TOKEN and client_id:
             return client_id[:64]
 
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return "ip:" + fwd.split(",")[0].strip()[:45]
+    if TRUSTED_PROXY_COUNT > 0:
+        fwd = request.headers.get("x-forwarded-for", "")
+        if fwd:
+            # Zanjirning oxiridan TRUSTED_PROXY_COUNT-chi qiymatni olamiz —
+            # proxy(lar) qo'shgan qiymatlarga ishonamiz, lekin mijoz o'zi
+            # header boshiga qo'shib yuborgan soxta qiymatlarga emas.
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            if len(parts) >= TRUSTED_PROXY_COUNT:
+                return "ip:" + parts[-TRUSTED_PROXY_COUNT][:45]
+
     return "ip:" + (request.client.host if request.client else "unknown")
 
 
@@ -82,6 +103,28 @@ class GenerateRequest(BaseModel):
     topic: str = Field(..., min_length=2, max_length=300)
     slide_count: int = Field(..., ge=3, le=20)
     theme: str = Field("minimal", pattern="^(minimal|corporate|warm|forest)$")
+
+
+class ReferralRequest(BaseModel):
+    new_user_id: int
+    referrer_id: int
+
+
+def _require_internal(request: Request) -> None:
+    """
+    Referal endpoint'lari faqat ICHKI mijoz (Telegram bot) tomonidan
+    chaqirilishi kerak — chunki bu yerda foydalanuvchi Telegram user_id'sini
+    o'zi bemalol istagan qiymat qilib yuborishi mumkin bo'lsa, bonus tizimini
+    suiiste'mol qilish oson bo'lardi. Shu sababli INTERNAL_TOKEN majburiy.
+    """
+    if not INTERNAL_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Referal tizimi sozlanmagan (INTERNAL_TOKEN yo'q).",
+        )
+    token = request.headers.get("x-internal-token", "")
+    if token != INTERNAL_TOKEN:
+        raise HTTPException(status_code=403, detail="Ruxsat yo'q")
 
 
 @app.get("/")
@@ -101,8 +144,29 @@ def health():
     return {"status": "ok", **jobs.manager.stats()}
 
 
+def _referral_bonus_for_request(request: Request) -> int:
+    """
+    Agar so'rov ichki mijoz (bot) tomonidan kelayotgan bo'lsa va x-user-id
+    header bilan Telegram user_id berilgan bo'lsa — shu foydalanuvchining
+    referal bonusini qaytaradi. Aks holda 0 (bonus yo'q, masalan veb orqali
+    IP asosida kelgan so'rovlar uchun — ular hali botga /start bosmagan).
+    """
+    if not INTERNAL_TOKEN:
+        return 0
+    token = request.headers.get("x-internal-token", "")
+    if token != INTERNAL_TOKEN:
+        return 0
+    raw_uid = request.headers.get("x-user-id", "")
+    try:
+        uid = int(raw_uid)
+    except (TypeError, ValueError):
+        return 0
+    return referrals.store.bonus_for(uid)
+
+
 @app.get("/limits")
 def limits(request: Request):
+    bonus = _referral_bonus_for_request(request)
     return {
         "limits": {
             "per_minute": limiter.per_minute,
@@ -111,8 +175,38 @@ def limits(request: Request):
             "global_per_minute": limiter.global_per_minute,
             "global_per_day": limiter.global_per_day,
         },
-        "remaining": limiter.remaining(_client_key(request)),
+        "referral_bonus": bonus,
+        "remaining": limiter.remaining(_client_key(request), extra_daily=bonus),
         "queue": jobs.manager.stats(),
+    }
+
+
+@app.post("/referrals/register")
+def register_referral(req: ReferralRequest, request: Request):
+    """
+    Yangi foydalanuvchi referal havolasi orqali botga kirganda bot bu
+    endpoint'ni chaqiradi. Faqat ichki (bot) so'rovlar qabul qilinadi.
+    """
+    _require_internal(request)
+    granted = referrals.store.register_referral(
+        new_user_id=req.new_user_id, referrer_id=req.referrer_id
+    )
+    return {
+        "granted": granted,
+        "referrer_bonus": referrals.store.bonus_for(req.referrer_id),
+        "referrer_invite_count": referrals.store.invite_count(req.referrer_id),
+    }
+
+
+@app.get("/referrals/{user_id}")
+def referral_status(user_id: int, request: Request):
+    """Shu foydalanuvchining joriy referal statistikasi (bot /referal uchun)."""
+    _require_internal(request)
+    return {
+        "invite_count": referrals.store.invite_count(user_id),
+        "bonus": referrals.store.bonus_for(user_id),
+        "bonus_max": referrals.BONUS_MAX,
+        "bonus_per_invite": referrals.BONUS_PER_INVITE,
     }
 
 
@@ -123,8 +217,9 @@ def generate(req: GenerateRequest, request: Request, response: Response):
     Holatni /status/{job_id} orqali kuzatib boring.
     """
     key = _client_key(request)
+    bonus = _referral_bonus_for_request(request)
 
-    allowed, reason, retry_after = limiter.check(key)
+    allowed, reason, retry_after = limiter.check(key, extra_daily=bonus)
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -149,7 +244,7 @@ def generate(req: GenerateRequest, request: Request, response: Response):
     _job, position = jobs.manager.get(job.job_id)
     payload = job.public(position)
     payload["filename"] = display_name
-    payload["remaining"] = limiter.remaining(key)
+    payload["remaining"] = limiter.remaining(key, extra_daily=bonus)
     response.headers["Location"] = f"/status/{job.job_id}"
     logger.info(
         "Yangi job %s (pdf) — %s slayd, theme=%s, owner=%s",

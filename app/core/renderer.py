@@ -171,7 +171,18 @@ def render_deck_to_pdf_pages(
             # PDF'da agar shrift hali tayyor bo'lmasa, matn fallback shrift
             # bilan "qotib" qolishi mumkin (screenshot'da bu faqat vizual
             # kamchilik edi, PDF'da esa embed qilingan holatda saqlanadi).
-            page.evaluate("document.fonts.ready.then(() => true)")
+            #
+            # MUHIM: page.evaluate("promise.then(...)") Playwright'da odatda
+            # natijani kutadi, lekin bu ishonchsiz — agar returnValue bo'lmasa
+            # yoki kimdir keyin "void ..." deb o'zgartirsa, PDF shrift
+            # yuklanishini kutmasdan olinib qoladi (bu xato faqat tarmoq sekin
+            # yoki bir nechta slayd parallel ishlaganda, tasodifiy namoyon
+            # bo'ladi). wait_for_function esa Playwright'ning maxsus API'si —
+            # shart `true` bo'lgunicha, aniq belgilangan timeout bilan, ochiq
+            # so'raladi va kutiladi.
+            page.wait_for_function(
+                "document.fonts.status === 'loaded'", timeout=8000
+            )
 
             pdf_path = os.path.join(output_dir, f"slide_{i:03d}.pdf")
             page.pdf(

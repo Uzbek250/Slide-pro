@@ -4,21 +4,24 @@ Telegram bot: mavzu → tayyor PDF taqdimot.
 Long-polling (getUpdates) asosida ishlaydi — webhook, ochiq port yoki HTTPS
 sertifikat kerak emas. Bot backend'ning HTTP API'sini chaqiradi:
 
-  POST /generate          → 202 {job_id, remaining} (navbatga tushadi)
-  GET  /status/{job_id}   → holat + REAL progress (pct, stage, slayd i/n)
-  GET  /limits            → foydalanuvchi limitlari
+  POST /generate            → 202 {job_id, remaining} (navbatga tushadi)
+  GET  /status/{job_id}     → holat + REAL progress (pct, stage, slayd i/n)
+  GET  /limits              → foydalanuvchi limitlari (referal bonusi bilan)
   POST /jobs/{job_id}/cancel — ishni bekor qilish
-  GET  /download/{job_id} → tayyor PDF
+  GET  /download/{job_id}   → tayyor PDF
+  POST /referrals/register  → do'st referal havolasi orqali kirganda qayd etish
+  GET  /referrals/{uid}     → foydalanuvchining referal statistikasi
 
 UX: ish davomida xabar jonli progress bar bilan yangilanadi (navbat holati,
 bosqich, foiz, qolgan vaqt), "❌ Bekor qilish" tugmasi bor. Tugagach
 "🔄 Qayta yaratish" va "⚙️ Sozlamalar" tugmalari chiqadi. Barcha menyular
-inline tugmalar orqali.
+inline tugmalar orqali. Bot ikki tilda ishlaydi: o'zbek (lotin) va rus.
 
 Ishga tushirish:
     export TELEGRAM_BOT_TOKEN=...            # @BotFather
     export API_BASE=http://127.0.0.1:8003    # backend manzili
-    export INTERNAL_TOKEN=...                # per-user limit uchun
+    export INTERNAL_TOKEN=...                # per-user limit va referal uchun
+    export BOT_USERNAME=...                  # referal havolasi uchun (masalan vbnderbot)
     python -m bot.telegram_bot
 """
 from __future__ import annotations
@@ -51,6 +54,10 @@ def _normalize_base(raw: str) -> str:
 
 API_BASE = _normalize_base(os.environ.get("API_BASE", ""))
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
+# Referal havolasi https://t.me/<username>?start=ref_<uid> ko'rinishida
+# quriladi — shuning uchun bot o'z username'ini bilishi kerak. Bo'sh
+# qoldirilsa, getMe orqali ishga tushishda avtomatik olinadi.
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")
 
 # Telegram bot API orqali yuborish chegarasi
 MAX_SEND_BYTES = 50 * 1024 * 1024
@@ -58,11 +65,306 @@ MAX_SEND_BYTES = 50 * 1024 * 1024
 # Progress bar uzunligi (belgi)
 BAR_LEN = 14
 
-STAGE_LABELS = {
-    "llm": "🤖 Matn tayyorlanmoqda",
-    "render": "🎨 Slaydlar chizilmoqda",
-    "merge": "📦 PDF yig'ilmoqda",
+Lang = str  # "uz" | "ru"
+DEFAULT_LANG: Lang = "uz"
+
+
+# ============================================================================
+# Ko'p tillilik: barcha foydalanuvchiga ko'rinadigan matnlar shu yerda,
+# bir joyda. Yangi til qo'shish uchun shunchaki yangi kalit (masalan "en")
+# qo'shish kifoya — kod boshqa hech qayerda o'zgarmaydi.
+# ============================================================================
+
+STAGE_LABELS: dict[Lang, dict[str, str]] = {
+    "uz": {
+        "llm": "🤖 Matn tayyorlanmoqda",
+        "render": "🎨 Slaydlar chizilmoqda",
+        "merge": "📦 PDF yig'ilmoqda",
+    },
+    "ru": {
+        "llm": "🤖 Готовится текст",
+        "render": "🎨 Отрисовка слайдов",
+        "merge": "📦 Сборка PDF",
+    },
 }
+
+THEMES: dict[Lang, dict[str, str]] = {
+    "uz": {
+        "minimal": "Minimal (qora urg'u)",
+        "corporate": "Corporate (ko'k)",
+        "warm": "Warm (to'q sariq)",
+        "forest": "Forest (yashil)",
+    },
+    "ru": {
+        "minimal": "Minimal (чёрный акцент)",
+        "corporate": "Corporate (синий)",
+        "warm": "Warm (оранжевый)",
+        "forest": "Forest (зелёный)",
+    },
+}
+
+SLIDE_CHOICES = [5, 8, 10, 15, 20]
+
+MIN_TOPIC_LEN = 2
+MAX_TOPIC_LEN = 300
+
+# Referal sozlamalari matnda ko'rsatish uchun (haqiqiy hisob-kitob backendda,
+# bu yerda faqat ko'rsatiladigan sonlar — .env bilan mos kelishi kerak).
+REFERRAL_BONUS_PER_INVITE = int(os.environ.get("REFERRAL_BONUS_PER_INVITE", "2") or "2")
+
+
+def _t(lang: Lang, uz: str, ru: str) -> str:
+    return ru if lang == "ru" else uz
+
+
+TEXTS: dict[str, dict[Lang, str]] = {
+    "welcome_title": {
+        "uz": "✨ <b>Slide — sun'iy intellektli taqdimot generatori</b>",
+        "ru": "✨ <b>Slide — генератор презентаций на базе ИИ</b>",
+    },
+    "welcome_body": {
+        "uz": (
+            "Menga mavzuni yozib yuboring — bir necha soniyada chuqur, "
+            "mazmunli va darsda yoki himoyada taqdim qilishga tayyor "
+            "<b>PDF taqdimot</b> qaytaraman.\n\n"
+            "📝 Masalan: <i>Sun'iy intellekt tibbiyotda</i>"
+        ),
+        "ru": (
+            "Просто напишите тему — через несколько секунд пришлю "
+            "содержательную <b>PDF-презентацию</b>, готовую для пары или "
+            "защиты.\n\n"
+            "📝 Например: <i>Искусственный интеллект в медицине</i>"
+        ),
+    },
+    "help_title": {
+        "uz": "🎯 <b>Slide — AI taqdimot generatori</b>",
+        "ru": "🎯 <b>Slide — генератор презентаций на ИИ</b>",
+    },
+    "help_body": {
+        "uz": (
+            "Ishlatish juda oddiy: mavzuni yozasiz, men tayyor PDF "
+            "taqdimotni yuboraman. Ish davomida progress bar ko'rinib "
+            "turadi, istasangiz <b>❌ Bekor qilish</b> tugmasi bilan "
+            "to'xtatishingiz mumkin."
+        ),
+        "ru": (
+            "Всё просто: пишете тему — получаете готовую PDF-презентацию. "
+            "Во время генерации виден прогресс-бар, в любой момент можно "
+            "нажать <b>❌ Отменить</b>."
+        ),
+    },
+    "help_commands": {
+        "uz": (
+            "Komandalar:\n"
+            "  /start — asosiy menyu\n"
+            "  /sozlama — slayd soni va dizayn\n"
+            "  /referal — do'stlarni taklif qilib bonus oling\n"
+            "  /til — tilni almashtirish\n"
+            "  /help — bu yordam"
+        ),
+        "ru": (
+            "Команды:\n"
+            "  /start — главное меню\n"
+            "  /sozlama — количество слайдов и дизайн\n"
+            "  /referal — пригласить друзей и получить бонус\n"
+            "  /til — сменить язык\n"
+            "  /help — эта справка"
+        ),
+    },
+    "current_settings": {
+        "uz": "Hozirgi sozlamalar",
+        "ru": "Текущие настройки",
+    },
+    "quota_line": {
+        "uz": "📊 Bugun sizda: <b>{left}/{total} ta</b> taqdimot yaratish imkoniyati qoldi",
+        "ru": "📊 Сегодня доступно: <b>{left}/{total}</b> генераций",
+    },
+    "quota_line_unlimited": {
+        "uz": "📊 Bugungi limit: cheklanmagan",
+        "ru": "📊 Лимит на сегодня: без ограничений",
+    },
+    "quota_hint_referral": {
+        "uz": "💡 Do'st taklif qiling — har biri uchun +{bonus} ta qo'shimcha limit! /referal",
+        "ru": "💡 Приглашайте друзей — за каждого +{bonus} к лимиту! /referal",
+    },
+    "settings_title": {
+        "uz": "⚙️ <b>Sozlamalar</b>",
+        "ru": "⚙️ <b>Настройки</b>",
+    },
+    "settings_change_hint": {
+        "uz": "O'zgartirish uchun tugmani bosing:",
+        "ru": "Нажмите кнопку, чтобы изменить:",
+    },
+    "topic_too_short": {
+        "uz": "Mavzu juda qisqa. Kamida 2 belgi yozing.",
+        "ru": "Тема слишком короткая. Введите хотя бы 2 символа.",
+    },
+    "topic_too_long": {
+        "uz": "Mavzu juda uzun ({n} belgi). {max} belgidan oshmasin.",
+        "ru": "Тема слишком длинная ({n} симв.). Не более {max} символов.",
+    },
+    "topic_only_text": {
+        "uz": "Faqat matnli mavzu qabul qilaman. Masalan: Yashil energiya O'zbekistonda",
+        "ru": "Принимаю только текстовую тему. Например: Зелёная энергетика в Узбекистане",
+    },
+    "busy": {
+        "uz": (
+            "⏳ Sizning oldingi so'rovingiz hali bajarilmoqda. "
+            "Tayyor bo'lishini kuting yoki bekor qiling."
+        ),
+        "ru": (
+            "⏳ Ваш предыдущий запрос ещё выполняется. "
+            "Дождитесь завершения или отмените его."
+        ),
+    },
+    "queue_position": {
+        "uz": "⏳ Navbatda: oldingizda {pos} ta so'rov\nTaxminiy kutish: {eta}",
+        "ru": "⏳ В очереди: перед вами {pos} запрос(ов)\nОжидание: ~{eta}",
+    },
+    "queue_waiting": {
+        "uz": "⏳ Navbatda… Taxminiy kutish: {eta}",
+        "ru": "⏳ В очереди… Ожидание: ~{eta}",
+    },
+    "eta_remaining": {
+        "uz": "\n⏱ Qolgan vaqt: ~{eta}",
+        "ru": "\n⏱ Осталось: ~{eta}",
+    },
+    "finalizing": {
+        "uz": "⚙️ Yakunlanmoqda…",
+        "ru": "⚙️ Завершается…",
+    },
+    "sending_file": {
+        "uz": "📤 Fayl yuborilmoqda…",
+        "ru": "📤 Отправка файла…",
+    },
+    "cancelled": {
+        "uz": "❌ Bekor qilindi.",
+        "ru": "❌ Отменено.",
+    },
+    "took_too_long": {
+        "uz": "⌛️ Juda uzoq davom etdi. Keyinroq qayta urinib ko'ring.",
+        "ru": "⌛️ Это заняло слишком много времени. Попробуйте позже.",
+    },
+    "file_not_sent": {
+        "uz": "❌ Faylni yuborib bo'lmadi. Qayta urinib ko'ring.",
+        "ru": "❌ Не удалось отправить файл. Попробуйте ещё раз.",
+    },
+    "file_too_big": {
+        "uz": (
+            "❌ Fayl juda katta ({mb:.1f} MB). "
+            "Slayd sonini kamaytirib ko'ring."
+        ),
+        "ru": (
+            "❌ Файл слишком большой ({mb:.1f} МБ). "
+            "Попробуйте уменьшить число слайдов."
+        ),
+    },
+    "file_download_failed": {
+        "uz": "❌ Fayl yuklanmadi: {err}",
+        "ru": "❌ Не удалось загрузить файл: {err}",
+    },
+    "done_caption": {
+        "uz": "✅ Tayyor — {slides} slayd, {took} s",
+        "ru": "✅ Готово — {slides} слайдов, {took} с",
+    },
+    "done_ready": {
+        "uz": "✅ <b>Tayyor</b> ({took} s, {size})",
+        "ru": "✅ <b>Готово</b> ({took} с, {size})",
+    },
+    "error_prefix": {
+        "uz": "❌ Xatolik: {err}",
+        "ru": "❌ Ошибка: {err}",
+    },
+    "not_accepted": {
+        "uz": "❌ So'rov qabul qilinmadi: {detail}",
+        "ru": "❌ Запрос не принят: {detail}",
+    },
+    "limit_reached": {
+        "uz": "🚫 {detail}",
+        "ru": "🚫 {detail}",
+    },
+    "server_busy": {
+        "uz": "🕒 {detail}",
+        "ru": "🕒 {detail}",
+    },
+    "unknown_command": {
+        "uz": "Noma'lum komanda. /help — yordam.",
+        "ru": "Неизвестная команда. /help — справка.",
+    },
+    "cancelling": {
+        "uz": "⏹ Bekor qilinyapti…",
+        "ru": "⏹ Отменяется…",
+    },
+    "cancel_failed": {
+        "uz": "❌ Ishnni bekor qilib bo'lmadi: {detail}",
+        "ru": "❌ Не удалось отменить запрос: {detail}",
+    },
+    "topic_not_found": {
+        "uz": "Mavzu topilmadi — yangi mavzu yozing",
+        "ru": "Тема не найдена — введите новую тему",
+    },
+    "regenerating": {
+        "uz": "🔄 Qayta yaratilmoqda…",
+        "ru": "🔄 Пересоздаётся…",
+    },
+    "referral_title": {
+        "uz": "🎁 <b>Do'stlaringizni taklif qiling</b>",
+        "ru": "🎁 <b>Приглашайте друзей</b>",
+    },
+    "referral_body": {
+        "uz": (
+            "Har bir do'stingiz sizning havolangiz orqali botga birinchi "
+            "marta kirsa — kunlik limitingizga <b>+{bonus} ta</b> "
+            "qo'shimcha imkoniyat qo'shiladi!\n\n"
+            "🔗 Sizning havolangiz:\n<code>{link}</code>\n\n"
+            "👥 Hozirgacha taklif qilganlar: <b>{count} kishi</b>\n"
+            "🎯 Joriy bonus: <b>+{current_bonus} ta/kun</b>"
+        ),
+        "ru": (
+            "Когда друг впервые заходит в бота по вашей ссылке — вы "
+            "получаете <b>+{bonus}</b> к дневному лимиту!\n\n"
+            "🔗 Ваша ссылка:\n<code>{link}</code>\n\n"
+            "👥 Уже приглашено: <b>{count}</b>\n"
+            "🎯 Текущий бонус: <b>+{current_bonus}/день</b>"
+        ),
+    },
+    "referral_share_button": {
+        "uz": "📤 Do'stlarga yuborish",
+        "ru": "📤 Отправить другу",
+    },
+    "referral_share_text": {
+        "uz": (
+            "🎯 Men Slide botidan foydalanyapman — mavzuni yozib yuborsang, "
+            "bir necha soniyada tayyor, chiroyli PDF taqdimot qaytaradi! "
+            "Universitet uchun juda qulay.\n\n"
+            "Sinab ko'r: {link}"
+        ),
+        "ru": (
+            "🎯 Пользуюсь ботом Slide — пишешь тему, а он за секунды "
+            "присылает готовую красивую PDF-презентацию! Очень удобно для "
+            "учёбы.\n\n"
+            "Попробуй: {link}"
+        ),
+    },
+    "referral_welcome_bonus": {
+        "uz": "🎉 Do'stingiz havolasi orqali kirdingiz — u kunlik limitiga bonus oldi. Xush kelibsiz!",
+        "ru": "🎉 Вы пришли по ссылке друга — он получил бонус к лимиту. Добро пожаловать!",
+    },
+    "lang_choose": {
+        "uz": "🌐 Tilni tanlang:",
+        "ru": "🌐 Выберите язык:",
+    },
+    "lang_set": {
+        "uz": "✅ Til o'zbek tiliga o'zgartirildi.",
+        "ru": "✅ Язык изменён на русский.",
+    },
+}
+
+
+def L(key: str, lang: Lang, **kwargs: object) -> str:
+    """TEXTS lug'atidan tarjima olib, mavjud bo'lsa .format() qiladi."""
+    template = TEXTS[key].get(lang) or TEXTS[key][DEFAULT_LANG]
+    return template.format(**kwargs) if kwargs else template
 
 
 def _bar(pct: int) -> str:
@@ -79,9 +381,15 @@ def _fmt_size(n: int) -> str:
     return f"{n / 1e6:.1f} MB"
 
 
-def _fmt_secs(secs: int) -> str:
+def _fmt_secs(secs: int, lang: Lang) -> str:
     """Sekundlarni ixcham ko'rsatadi: 45 s / 2 daq 10 s / 1 soat."""
     secs = max(0, int(secs))
+    if lang == "ru":
+        if secs < 60:
+            return f"{secs} с"
+        if secs < 3600:
+            return f"{secs // 60} мин {secs % 60:02d} с"
+        return f"{secs // 3600} ч {(secs % 3600) // 60:02d} мин"
     if secs < 60:
         return f"{secs} s"
     if secs < 3600:
@@ -89,31 +397,19 @@ def _fmt_secs(secs: int) -> str:
     return f"{secs // 3600} soat {(secs % 3600) // 60:02d} daq"
 
 
-THEMES = {
-    "minimal": "Minimal (qora urg'u)",
-    "corporate": "Corporate (ko'k)",
-    "warm": "Warm (to'q sariq)",
-    "forest": "Forest (yashil)",
-}
-SLIDE_CHOICES = [5, 8, 10, 15, 20]
-
-MIN_TOPIC_LEN = 2
-MAX_TOPIC_LEN = 300
-
-
 class Prefs:
     """Foydalanuvchi tanlovlari (xotirada; restartda standartga qaytadi)."""
 
-    __slots__ = ("slides", "theme")
+    __slots__ = ("slides", "theme", "lang")
 
     def __init__(self) -> None:
         self.slides = 8
         self.theme = "minimal"
+        self.lang: Lang = DEFAULT_LANG
 
     def summary(self) -> str:
-        return (
-            f"{self.slides} slayd · PDF · {THEMES[self.theme].split(' (')[0]}"
-        )
+        theme_label = THEMES[self.lang][self.theme].split(" (")[0]
+        return f"{self.slides} · PDF · {theme_label}"
 
 
 class SlideBot:
@@ -133,6 +429,7 @@ class SlideBot:
         self._busy: set[int] = set()
         # Oxirgi mavzu — "🔄 Qayta yaratish" tugmasi uchun
         self._last_topic: dict[int, str] = {}
+        self._username = BOT_USERNAME
 
     # ------------------------------------------------------------------ #
     # Telegram API
@@ -217,6 +514,9 @@ class SlideBot:
         def mark(active: bool, label: str) -> str:
             return ("✅ " if active else "") + label
 
+        lang = p.lang
+        themes = THEMES[lang]
+        home_label = _t(lang, "🏠 Asosiy menyu", "🏠 Главное меню")
         kb = {
             "inline_keyboard": [
                 [
@@ -228,72 +528,118 @@ class SlideBot:
                     for n in (15, 20)
                 ],
                 [
-                    {"text": mark(p.theme == "minimal", "Minimal"), "callback_data": "theme:minimal"},
-                    {"text": mark(p.theme == "corporate", "Corporate"), "callback_data": "theme:corporate"},
+                    {"text": mark(p.theme == "minimal", themes["minimal"].split(" (")[0]), "callback_data": "theme:minimal"},
+                    {"text": mark(p.theme == "corporate", themes["corporate"].split(" (")[0]), "callback_data": "theme:corporate"},
                 ],
                 [
-                    {"text": mark(p.theme == "warm", "Warm"), "callback_data": "theme:warm"},
-                    {"text": mark(p.theme == "forest", "Forest"), "callback_data": "theme:forest"},
+                    {"text": mark(p.theme == "warm", themes["warm"].split(" (")[0]), "callback_data": "theme:warm"},
+                    {"text": mark(p.theme == "forest", themes["forest"].split(" (")[0]), "callback_data": "theme:forest"},
                 ],
-                [{"text": "🏠 Asosiy menyu", "callback_data": "menu:main"}],
+                [{"text": home_label, "callback_data": "menu:main"}],
             ]
         }
         return kb
 
-    def _main_keyboard(self) -> dict:
+    def _main_keyboard(self, lang: Lang) -> dict:
         return {
             "inline_keyboard": [
                 [
-                    {"text": "⚙️ Sozlamalar", "callback_data": "menu:settings"},
-                    {"text": "❓ Yordam", "callback_data": "menu:help"},
+                    {"text": _t(lang, "⚙️ Sozlamalar", "⚙️ Настройки"), "callback_data": "menu:settings"},
+                    {"text": _t(lang, "🎁 Referal", "🎁 Реферал"), "callback_data": "menu:referral"},
+                ],
+                [
+                    {"text": _t(lang, "❓ Yordam", "❓ Помощь"), "callback_data": "menu:help"},
+                    {"text": "🌐 uz / ru", "callback_data": "menu:lang"},
                 ],
             ]
         }
 
-    def _cancel_keyboard(self, job_id: str) -> dict:
+    def _lang_keyboard(self) -> dict:
         return {
             "inline_keyboard": [[
-                {"text": "❌ Bekor qilish", "callback_data": f"cancel:{job_id}"},
+                {"text": "🇺🇿 O'zbekcha", "callback_data": "lang:uz"},
+                {"text": "🇷🇺 Русский", "callback_data": "lang:ru"},
             ]]
         }
 
-    def _done_keyboard(self) -> dict:
+    def _cancel_keyboard(self, job_id: str, lang: Lang) -> dict:
+        return {
+            "inline_keyboard": [[
+                {"text": _t(lang, "❌ Bekor qilish", "❌ Отменить"), "callback_data": f"cancel:{job_id}"},
+            ]]
+        }
+
+    def _done_keyboard(self, lang: Lang) -> dict:
         return {
             "inline_keyboard": [
                 [
-                    {"text": "🔄 Qayta yaratish", "callback_data": "again"},
-                    {"text": "⚙️ Sozlamalar", "callback_data": "menu:settings"},
+                    {"text": _t(lang, "🔄 Qayta yaratish", "🔄 Создать заново"), "callback_data": "again"},
+                    {"text": _t(lang, "⚙️ Sozlamalar", "⚙️ Настройки"), "callback_data": "menu:settings"},
                 ],
+            ]
+        }
+
+    def _referral_keyboard(self, lang: Lang, link: str) -> dict:
+        share_text = L("referral_share_text", lang, link=link)
+        share_url = "https://t.me/share/url?" + httpx.QueryParams(
+            {"url": link, "text": share_text}
+        ).__str__()
+        return {
+            "inline_keyboard": [
+                [{"text": L("referral_share_button", lang), "url": share_url}],
+                [{"text": _t(lang, "🏠 Asosiy menyu", "🏠 Главное меню"), "callback_data": "menu:main"}],
             ]
         }
 
     def prefs(self, uid: int) -> Prefs:
         return self._prefs.setdefault(uid, Prefs())
 
-    def _welcome_text(self, p: Prefs) -> str:
-        return (
-            "🎯 <b>Slide — AI taqdimot generatori</b>\n\n"
-            "Menga mavzuni yozib yuboring — tayyor PDF taqdimotni "
-            "fayl ko'rinishida qaytaraman.\n\n"
-            "📝 Masalan: <i>Sun'iy intellekt tibbiyotda</i>\n\n"
-            f"Hozirgi sozlamalar: <b>{p.summary()}</b>\n\n"
-            "Quyidagi tugmalardan sozlamalarni o'zgartirishingiz mumkin 👇"
-        )
+    def _referral_link(self, uid: int) -> str:
+        uname = self._username or "your_bot"
+        return f"https://t.me/{uname}?start=ref_{uid}"
+
+    def _quota_text(self, lang: Lang, remaining: dict, bonus: int) -> str:
+        left = remaining.get("day_left", -1)
+        total = remaining.get("day_limit", -1)
+        if left is None or left < 0 or total is None or total <= 0:
+            base = L("quota_line_unlimited", lang)
+        else:
+            base = L("quota_line", lang, left=left, total=total)
+        hint = ""
+        if bonus < 10:  # hali maksimal bonusga yetmagan bo'lsa taklif qilamiz
+            hint = "\n" + L("quota_hint_referral", lang, bonus=REFERRAL_BONUS_PER_INVITE)
+        return base + hint
+
+    def _welcome_text(self, p: Prefs, quota_text: str = "") -> str:
+        lang = p.lang
+        parts = [
+            L("welcome_title", lang),
+            "",
+            L("welcome_body", lang),
+        ]
+        if quota_text:
+            parts += ["", quota_text]
+        parts += [
+            "",
+            f"{L('current_settings', lang)}: <b>{p.summary()}</b>",
+        ]
+        return "\n".join(parts)
 
     def _help_text(self, p: Prefs) -> str:
+        lang = p.lang
+        return "\n\n".join([
+            L("help_title", lang),
+            L("help_body", lang),
+            f"{L('current_settings', lang)}: <b>{p.summary()}</b>",
+            L("help_commands", lang),
+        ])
+
+    def _settings_text(self, p: Prefs) -> str:
+        lang = p.lang
         return (
-            "🎯 <b>Slide — AI taqdimot generatori</b>\n\n"
-            "Ishlatish juda oddiy: mavzuni yozasiz, men tayyor PDF "
-            "taqdimotni yuboraman. Ish davomida progress bar ko'rinib "
-            "turadi, istasangiz <b>❌ Bekor qilish</b> tugmasi bilan "
-            "to'xtatishingiz mumkin.\n\n"
-            f"Hozirgi sozlamalar: <b>{p.summary()}</b>\n\n"
-            "Komandalar:\n"
-            "  /start — asosiy menyu\n"
-            "  /sozlama — slayd soni va dizayn\n"
-            "  /help — bu yordam\n\n"
-            "Sozlamalarni <b>⚙️ Sozlamalar</b> tugmasi orqali ham "
-            "o'zgartirsa bo'ladi."
+            f"{L('settings_title', lang)}\n\n"
+            f"{L('current_settings', lang)}: {p.summary()}\n\n"
+            f"{L('settings_change_hint', lang)}"
         )
 
     # ------------------------------------------------------------------ #
@@ -304,6 +650,7 @@ class SlideBot:
         if INTERNAL_TOKEN:
             h["X-Internal-Token"] = INTERNAL_TOKEN
             h["X-Client-Id"] = f"tg:{uid}"
+            h["X-User-Id"] = str(uid)
         return h
 
     async def _api_generate(self, uid: int, topic: str, p: Prefs) -> tuple[int, dict]:
@@ -346,35 +693,78 @@ class SlideBot:
         r.raise_for_status()
         return r.content
 
+    async def _api_limits(self, uid: int) -> dict | None:
+        try:
+            r = await self._http.get(
+                f"{API_BASE}/limits", headers=self._headers(uid), timeout=15.0
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("limits olinmadi (%s): %s", uid, exc)
+        return None
+
+    async def _api_register_referral(self, new_uid: int, referrer_uid: int) -> dict | None:
+        if not INTERNAL_TOKEN:
+            return None
+        try:
+            r = await self._http.post(
+                f"{API_BASE}/referrals/register",
+                json={"new_user_id": new_uid, "referrer_id": referrer_uid},
+                headers={"X-Internal-Token": INTERNAL_TOKEN, "Content-Type": "application/json"},
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("referral register xato: %s", exc)
+        return None
+
+    async def _api_referral_status(self, uid: int) -> dict | None:
+        if not INTERNAL_TOKEN:
+            return None
+        try:
+            r = await self._http.get(
+                f"{API_BASE}/referrals/{uid}",
+                headers={"X-Internal-Token": INTERNAL_TOKEN},
+                timeout=15.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("referral status xato: %s", exc)
+        return None
+
     # ------------------------------------------------------------------ #
     # Progress xabari matni
     # ------------------------------------------------------------------ #
-    def _progress_text(self, head: str, st: dict) -> str:
+    def _progress_text(self, head: str, st: dict, lang: Lang) -> str:
         """Navbat/progress holatidan chiroyli matn yasaydi."""
         status = st.get("status")
         if status == "queued":
             pos = st.get("queue_position", 0)
-            eta = st.get("eta_seconds", 0)
-            body = (
-                f"⏳ Navbatda: oldingizda {pos} ta so'rov\n"
-                f"Taxminiy kutish: {_fmt_secs(eta)}"
-                if pos else f"⏳ Navbatda… Taxminiy kutish: {_fmt_secs(eta)}"
-            )
+            eta = _fmt_secs(st.get("eta_seconds", 0), lang)
+            if pos:
+                body = L("queue_position", lang, pos=pos, eta=eta)
+            else:
+                body = L("queue_waiting", lang, eta=eta)
         elif status == "running":
             pr = st.get("progress") or {}
             pct = pr.get("pct", 0)
             stage = pr.get("stage", "")
             slide, total = pr.get("slide", 0), pr.get("total_slides", 0)
-            stage_txt = STAGE_LABELS.get(stage, "⚙️ Tayyorlanmoqda")
-            slide_txt = f" ({slide}/{total} slayd)" if total else ""
+            stage_txt = STAGE_LABELS.get(lang, STAGE_LABELS["uz"]).get(
+                stage, _t(lang, "⚙️ Tayyorlanmoqda", "⚙️ Подготовка")
+            )
+            slide_txt = f" ({slide}/{total})" if total else ""
             eta = st.get("eta_seconds")
-            eta_txt = f"\n⏱ Qolgan vaqt: ~{_fmt_secs(eta)}" if eta else ""
+            eta_txt = L("eta_remaining", lang, eta=_fmt_secs(eta, lang)) if eta else ""
             body = (
                 f"{_bar(pct)} <b>{pct}%</b>\n"
                 f"{stage_txt}{slide_txt}{eta_txt}"
             )
         else:  # done/error/cancelled — oxirgi kadr
-            body = "⚙️ Yakunlanmoqda…"
+            body = L("finalizing", lang)
         return f"{head}\n\n{body}"
 
     # ------------------------------------------------------------------ #
@@ -382,22 +772,19 @@ class SlideBot:
     # ------------------------------------------------------------------ #
     async def _handle_topic(self, chat_id: int, uid: int, topic: str) -> None:
         p = self.prefs(uid)
+        lang = p.lang
 
         if uid in self._busy:
-            await self.send(
-                chat_id,
-                "⏳ Sizning oldingi so'rovingiz hali bajarilmoqda. "
-                "Tayyor bo'lishini kuting yoki bekor qiling.",
-            )
+            await self.send(chat_id, L("busy", lang))
             return
 
         topic = topic.strip()
         if len(topic) < MIN_TOPIC_LEN:
-            await self.send(chat_id, "Mavzu juda qisqa. Kamida 2 belgi yozing.")
+            await self.send(chat_id, L("topic_too_short", lang))
             return
         if len(topic) > MAX_TOPIC_LEN:
             await self.send(
-                chat_id, f"Mavzu juda uzun ({len(topic)} belgi). {MAX_TOPIC_LEN} belgidan oshmasin."
+                chat_id, L("topic_too_long", lang, n=len(topic), max=MAX_TOPIC_LEN)
             )
             return
 
@@ -408,12 +795,12 @@ class SlideBot:
 
             if code == 429:
                 await self.send(
-                    chat_id, f"🚫 {html.escape(str(data.get('detail', 'Limit tugadi.')))}"
+                    chat_id, L("limit_reached", lang, detail=html.escape(str(data.get("detail", ""))))
                 )
                 return
             if code == 503:
                 await self.send(
-                    chat_id, f"🕒 {html.escape(str(data.get('detail', 'Server band.')))}"
+                    chat_id, L("server_busy", lang, detail=html.escape(str(data.get("detail", ""))))
                 )
                 return
             if code not in (200, 202):
@@ -421,8 +808,7 @@ class SlideBot:
                 if isinstance(detail, list) and detail:
                     detail = detail[0].get("msg", str(detail))
                 await self.send(
-                    chat_id,
-                    f"❌ So'rov qabul qilinmadi: {html.escape(str(detail))}",
+                    chat_id, L("not_accepted", lang, detail=html.escape(str(detail)))
                 )
                 return
 
@@ -431,8 +817,8 @@ class SlideBot:
 
             msg_id = await self.send(
                 chat_id,
-                self._progress_text(head, data),
-                self._cancel_keyboard(job_id),
+                self._progress_text(head, data, lang),
+                self._cancel_keyboard(job_id, lang),
             )
 
             deadline = time.time() + 15 * 60
@@ -452,39 +838,33 @@ class SlideBot:
                     break
 
                 # Progress xabarini yangilash (har 3 soniyada, matn o'zgarsa)
-                text = self._progress_text(head, st)
+                text = self._progress_text(head, st, lang)
                 now = time.time()
                 if text != last_text and msg_id and (now - last_edit >= 3.0):
-                    await self.edit(chat_id, msg_id, text, self._cancel_keyboard(job_id))
+                    await self.edit(chat_id, msg_id, text, self._cancel_keyboard(job_id, lang))
                     last_text = text
                     last_edit = now
 
             if st.get("status") == "done":
                 if msg_id:
-                    await self.edit(
-                        chat_id, msg_id,
-                        f"{head}\n\n📤 Fayl yuborilmoqda…",
-                    )
+                    await self.edit(chat_id, msg_id, f"{head}\n\n{L('sending_file', lang)}")
             elif st.get("status") == "cancelled":
                 if msg_id:
-                    await self.edit(chat_id, msg_id, f"{head}\n\n❌ Bekor qilindi.")
+                    await self.edit(chat_id, msg_id, f"{head}\n\n{L('cancelled', lang)}")
                 else:
-                    await self.send(chat_id, "❌ Bekor qilindi.")
+                    await self.send(chat_id, L("cancelled", lang))
                 return
             elif st.get("status") == "error":
-                err = st.get("error", "noma'lum xato")
-                body = f"{head}\n\n❌ Xatolik: {html.escape(err[:300])}"
+                err = st.get("error", "")
+                body = f"{head}\n\n{L('error_prefix', lang, err=html.escape(err[:300]))}"
                 if msg_id:
-                    await self.edit(chat_id, msg_id, body, self._done_keyboard())
+                    await self.edit(chat_id, msg_id, body, self._done_keyboard(lang))
                 else:
-                    await self.send(chat_id, body, self._done_keyboard())
+                    await self.send(chat_id, body, self._done_keyboard(lang))
                 return
             else:
                 if msg_id:
-                    await self.edit(
-                        chat_id, msg_id,
-                        f"{head}\n\n⌛️ Juda uzoq davom etdi. Keyinroq qayta urinib ko'ring.",
-                    )
+                    await self.edit(chat_id, msg_id, f"{head}\n\n{L('took_too_long', lang)}")
                 return
 
             try:
@@ -492,15 +872,14 @@ class SlideBot:
             except Exception as exc:  # noqa: BLE001
                 await self.edit(
                     chat_id, msg_id or 0,
-                    f"{head}\n\n❌ Fayl yuklanmadi: {html.escape(str(exc))}",
+                    f"{head}\n\n{L('file_download_failed', lang, err=html.escape(str(exc)))}",
                 )
                 return
 
             if len(blob) > MAX_SEND_BYTES:
                 await self.edit(
                     chat_id, msg_id or 0,
-                    f"{head}\n\n❌ Fayl juda katta ({len(blob) / 1e6:.1f} MB). "
-                    "Slayd sonini kamaytirib ko'ring.",
+                    f"{head}\n\n{L('file_too_big', lang, mb=len(blob) / 1e6)}",
                 )
                 return
 
@@ -508,41 +887,85 @@ class SlideBot:
             took = st.get("took_seconds", "?")
             ok = await self.send_document(
                 chat_id, blob, filename,
-                caption=f"✅ Tayyor — {p.slides} slayd, {took} s",
+                caption=L("done_caption", lang, slides=p.slides, took=took),
             )
             if ok and msg_id:
                 await self.edit(
                     chat_id, msg_id,
-                    f"{head}\n\n✅ <b>Tayyor</b> ({took} s, {_fmt_size(len(blob))})",
-                    self._done_keyboard(),
+                    f"{head}\n\n{L('done_ready', lang, took=took, size=_fmt_size(len(blob)))}",
+                    self._done_keyboard(lang),
                 )
             elif not ok:
-                await self.send(chat_id, "❌ Faylni yuborib bo'lmadi. Qayta urinib ko'ring.")
+                await self.send(chat_id, L("file_not_sent", lang))
         finally:
             self._busy.discard(uid)
 
     # ------------------------------------------------------------------ #
     # Komandalar / callback
     # ------------------------------------------------------------------ #
+    async def _show_referral(self, chat_id: int, uid: int) -> None:
+        p = self.prefs(uid)
+        lang = p.lang
+        status = await self._api_referral_status(uid)
+        count = status.get("invite_count", 0) if status else 0
+        current_bonus = status.get("bonus", 0) if status else 0
+        link = self._referral_link(uid)
+        text = (
+            f"{L('referral_title', lang)}\n\n"
+            + L(
+                "referral_body", lang,
+                bonus=REFERRAL_BONUS_PER_INVITE, link=link,
+                count=count, current_bonus=current_bonus,
+            )
+        )
+        await self.send(chat_id, text, self._referral_keyboard(lang, link))
+
+    async def _handle_start(self, chat_id: int, uid: int, text: str) -> None:
+        p = self.prefs(uid)
+
+        # Referal payload: /start ref_<referrer_id>
+        parts = text.strip().split(maxsplit=1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+        welcome_extra = ""
+        if payload.startswith("ref_"):
+            ref_id_raw = payload[4:]
+            try:
+                referrer_id = int(ref_id_raw)
+                result = await self._api_register_referral(uid, referrer_id)
+                if result and result.get("granted"):
+                    welcome_extra = "\n\n" + L("referral_welcome_bonus", p.lang)
+            except (TypeError, ValueError):
+                pass
+
+        remaining = await self._api_limits(uid)
+        quota_text = ""
+        if remaining:
+            quota_text = self._quota_text(
+                p.lang, remaining.get("remaining", {}), remaining.get("referral_bonus", 0)
+            )
+
+        await self.send(
+            chat_id,
+            self._welcome_text(p, quota_text) + welcome_extra,
+            self._main_keyboard(p.lang),
+        )
+
     async def _handle_command(self, chat_id: int, uid: int, text: str) -> None:
         cmd = text.strip().split()[0].lower().split("@")[0]
         p = self.prefs(uid)
 
-        if cmd in ("/start",):
-            await self.send(
-                chat_id, self._welcome_text(p), self._main_keyboard(),
-            )
-        elif cmd in ("/help",):
+        if cmd == "/start":
+            await self._handle_start(chat_id, uid, text)
+        elif cmd == "/help":
             await self.send(chat_id, self._help_text(p))
         elif cmd in ("/sozlama", "/settings"):
-            await self.send(
-                chat_id,
-                f"⚙️ <b>Sozlamalar</b>\n\nHozir: {p.summary()}\n\n"
-                "O'zgartirish uchun tugmani bosing:",
-                self._settings_keyboard(p),
-            )
+            await self.send(chat_id, self._settings_text(p), self._settings_keyboard(p))
+        elif cmd in ("/referal", "/referral"):
+            await self._show_referral(chat_id, uid)
+        elif cmd == "/til":
+            await self.send(chat_id, L("lang_choose", p.lang), self._lang_keyboard())
         else:
-            await self.send(chat_id, "Noma'lum komanda. /help — yordam.")
+            await self.send(chat_id, L("unknown_command", p.lang))
 
     async def _handle_callback(self, cb: dict) -> None:
         data = cb.get("data", "")
@@ -554,65 +977,60 @@ class SlideBot:
             return
 
         p = self.prefs(uid)
+        lang = p.lang
         kind, _, value = data.partition(":")
         note = ""
 
         if kind == "slides" and value.isdigit() and int(value) in SLIDE_CHOICES:
             p.slides = int(value)
-            note = f"{p.slides} slayd ✅"
+            note = f"{p.slides} ✅"
             await self.answer_callback(cb["id"], note)
             if message_id:
-                await self.edit(
-                    chat_id, message_id,
-                    f"⚙️ <b>Sozlamalar</b>\n\nHozir: {p.summary()}\n\n"
-                    "O'zgartirish uchun tugmani bosing:",
-                    self._settings_keyboard(p),
-                )
+                await self.edit(chat_id, message_id, self._settings_text(p), self._settings_keyboard(p))
             return
-        elif kind == "theme" and value in THEMES:
+        elif kind == "theme" and value in THEMES[lang]:
             p.theme = value
-            note = f"Dizayn: {THEMES[value]} ✅"
+            note = f"{THEMES[lang][value]} ✅"
             await self.answer_callback(cb["id"], note)
             if message_id:
-                await self.edit(
-                    chat_id, message_id,
-                    f"⚙️ <b>Sozlamalar</b>\n\nHozir: {p.summary()}\n\n"
-                    "O'zgartirish uchun tugmani bosing:",
-                    self._settings_keyboard(p),
-                )
+                await self.edit(chat_id, message_id, self._settings_text(p), self._settings_keyboard(p))
+            return
+
+        if kind == "lang" and value in ("uz", "ru"):
+            p.lang = value
+            await self.answer_callback(cb["id"], L("lang_set", value))
+            if message_id:
+                await self.edit(chat_id, message_id, self._welcome_text(p), self._main_keyboard(p.lang))
             return
 
         # Menyu tugmalari
         if kind == "menu":
             if value == "settings":
-                await self.answer_callback(cb["id"], "⚙️ Sozlamalar")
-                await self.send(
-                    chat_id,
-                    f"⚙️ <b>Sozlamalar</b>\n\nHozir: {p.summary()}\n\n"
-                    "O'zgartirish uchun tugmani bosing:",
-                    self._settings_keyboard(p),
-                )
+                await self.answer_callback(cb["id"], L("settings_title", lang))
+                await self.send(chat_id, self._settings_text(p), self._settings_keyboard(p))
+            elif value == "referral":
+                await self.answer_callback(cb["id"], L("referral_title", lang))
+                await self._show_referral(chat_id, uid)
             elif value == "help":
-                await self.answer_callback(cb["id"], "❓ Yordam")
+                await self.answer_callback(cb["id"], L("help_title", lang))
                 await self.send(chat_id, self._help_text(p))
+            elif value == "lang":
+                await self.answer_callback(cb["id"])
+                await self.send(chat_id, L("lang_choose", lang), self._lang_keyboard())
             elif value == "main":
-                await self.answer_callback(cb["id"], "🏠 Asosiy menyu")
+                await self.answer_callback(cb["id"])
                 if message_id:
-                    await self.edit(
-                        chat_id, message_id,
-                        self._welcome_text(p), self._main_keyboard(),
-                    )
+                    await self.edit(chat_id, message_id, self._welcome_text(p), self._main_keyboard(lang))
             return
 
         # Bekor qilish
         if kind == "cancel" and value:
-            await self.answer_callback(cb["id"], "⏹ Bekor qilinyapti…")
+            await self.answer_callback(cb["id"], L("cancelling", lang))
             code, body = await self._api_cancel(value)
             if code not in (200, 202) and not (body or {}).get("status") == "cancelled":
                 await self.send(
                     chat_id,
-                    "❌ Ishnni bekor qilib bo'lmadi: "
-                    f"{html.escape(str(body.get('detail', body)))}",
+                    L("cancel_failed", lang, detail=html.escape(str(body.get("detail", body)))),
                 )
             return
 
@@ -620,9 +1038,9 @@ class SlideBot:
         if kind == "again":
             topic = self._last_topic.get(uid, "")
             if not topic:
-                await self.answer_callback(cb["id"], "Mavzu topilmadi — yangi mavzu yozing")
+                await self.answer_callback(cb["id"], L("topic_not_found", lang))
                 return
-            await self.answer_callback(cb["id"], "🔄 Qayta yaratilmoqda…")
+            await self.answer_callback(cb["id"], L("regenerating", lang))
             asyncio.create_task(self._handle_topic(chat_id, uid, topic))
             return
 
@@ -646,10 +1064,7 @@ class SlideBot:
         text = message.get("text") or ""
 
         if not text:
-            await self.send(
-                chat_id,
-                "Faqat matnli mavzu qabul qilaman. Masalan: Yashil energiya O'zbekistonda",
-            )
+            await self.send(chat_id, L("topic_only_text", self.prefs(uid).lang))
             return
 
         if text.startswith("/"):
@@ -661,6 +1076,8 @@ class SlideBot:
 
     async def run(self) -> None:
         me = await self._call("getMe")
+        if not self._username:
+            self._username = me.get("username", "")
         logger.info("Bot ishga tushdi: @%s (API_BASE=%s)", me.get("username"), API_BASE)
         # Eski, to'planib qolgan updatelarni tashlab yuboramiz — restartdan
         # keyin bot bir necha kunlik xabarlarga javob bermasin.
